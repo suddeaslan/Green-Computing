@@ -1,4 +1,3 @@
-# Green-Computing
 # Green Computing Strategies for Healthcare Predictive Models
 
 🌱 **A Data Science Project on Computational Sustainability in Healthcare AI**
@@ -56,4 +55,24 @@ To create an energy-saving version without sacrificing predictive accuracy, the 
 ### Python: Baseline vs. Green-Optimized
 By introducing green strategies in Python, the overall pipeline computational requirement plummeted with practically negligible impacts on accuracy:
 * **Total Energy Consumption:** Decreased from **3.97 Wh to 2.05 Wh** (A massive **48.4% reduction**).
-* **Total Execution Time:** Decreased from
+* **Total Execution Time:** Decreased from **272.2 seconds to 140.8 seconds** (**48.3% faster**).
+
+### 🔀 Cross-Platform Comparison (Python vs. R)
+Translating the optimized model into R highlighted stark architectural differences in how programming languages manage hardware loads:
+
+| Model | Elapsed Time Change (Python → R) | Energy Consumption Change (Wh) | CO2 Emissions Change (g) | Efficiency Verdict |
+| :--- | :---: | :---: | :---: | :--- |
+| **Random Forest (RF)** | 📉 **-72.62%** | 📉 **-71.21%** | 📉 **-78.57%** | **R is significantly more efficient** (3.6x faster, drastically lower footprint). |
+| **Logistic Regression (LR)** | 📈 +71.28% | 📈 +8.70% | 📉 -16.67% | **Marginal trade-off** (Low mathematical complexity kept them closely matched). |
+| **XGBoost** | 📈 +19.60% | 📈 +48.65% | 📈 +9.09% | **Python is more efficient** (R ran slower and drew ~1.5x more energy). |
+
+---
+
+## 🚀 Conclusion
+This research proves that **Green Computing is no longer a choice—it is a responsibility.** Sustainable tech can achieve identical performance benchmarks with significantly less harm to our planet. The choice of algorithms, hyperparameter constraints, memory handling, and even the programming language itself can drastically alter the digital carbon footprint.
+
+---
+
+## 📚 References
+* Strubell, E., Ganesh, A., & McCallum, A. (2019). *Energy and Policy Considerations for Deep Learning in NLP*. In Proceedings of ACL.
+* CodeCarbon Contributors. (2025). *CodeCarbon: Track and reduce the carbon footprint of your machine learning models*. Python Package Index.
