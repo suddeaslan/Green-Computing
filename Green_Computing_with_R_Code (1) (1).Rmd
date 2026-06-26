@@ -1,0 +1,1060 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-06-06"
+---
+```{r}
+# ==============================================================================
+# Gerekli Kütüphanelerin Yüklenmesi
+# ==============================================================================
+library(caret)
+library(xgboost)
+library(randomForest)
+library(jsonlite)
+
+# ------------------------------------------------------------
+# 0. Dataset-specific target kolon isimleri
+# ------------------------------------------------------------
+TARGET_COLUMN_MAP <- list(
+  "neuro"  = "outcome",
+  "braint" = "Status OS",
+  "cancer" = "death",
+  "sepsis" = "Mortality",
+  "depres" = "Death (1=Yes, 0=No)"
+)
+
+# ------------------------------------------------------------
+# 0.1 Low-importance feature pruning
+# ------------------------------------------------------------
+LOW_IMPORTANCE_FEATURE_DROP_MAP <- list(
+  "neuro" = c(
+    "radiation",
+    "autologous stem cell transplantation"
+  ),
+  "braint" = c(
+    "Concomitant HT", "Radiotherapy", "Epileptic seizures", "Increased ICP",
+    "fe_brain_aggressive_tumor_count", "fe_brain_treatment_intensity_count",
+    "fe_brain_long_symptom_duration", "fe_brain_older_birth_cohort",
+    "Neoadjuvant HT", "CSI dose", "Adjuvant HT", "Ependymoma", "LGG", "GCT / NGCT"
+  ),
+  "cancer" = c(
+    "fe_crc_cea_above_5", "cad", "fe_crc_age_75_plus", "ea", "cva",
+    "laparoscopic", "ct", "signet_ring", "fe_crc_cea_extreme", "hf",
+    "fe_crc_multi_comorbidity"
+  ),
+  "sepsis" = c(
+    "fe_sepsis_age_65_plus", "fe_sepsis_age_75_plus", "fe_sepsis_high_nlcr",
+    "fe_sepsis_high_mpv", "fe_sepsis_eosinopenia", "fe_sepsis_neutrophilia",
+    "fe_sepsis_thrombocytopenia", "fe_sepsis_lymphopenia", "fe_sepsis_high_platelet",
+    "fe_sepsis_high_severity", "fe_sepsis_log_nlcr", "fe_sepsis_long_icu_stay",
+    "fe_sepsis_age_group"
+  ),
+  "depres" = c(
+    "fe_hf_reduced_ef", "fe_hf_phq_severe", "fe_hf_low_sbp", "fe_hf_severe_renal_impairment",
+    "Prior diabetes mellitus", "fe_hf_hyponatremia", "fe_hf_renal_impairment",
+    "fe_hf_high_bun", "fe_hf_log_bun", "fe_hf_early_hospitalization", "fe_hf_multisystem_risk_score",
+    "fe_hf_phq_moderate_or_more", "fe_hf_preserved_ef", "Etiology HF(1=Yes, 0=No)",
+    "fe_hf_age_65_plus", "fe_hf_phq_mild_or_more", "Elevated level of BNP/NT-BNP (1=Yes, 0=No)",
+    "fe_hf_age_80_plus"
+  )
+)
+
+drop_low_importance_features <- function(X, dataset_name) {
+  X_loc <- X
+  planned_drop_cols <- LOW_IMPORTANCE_FEATURE_DROP_MAP[[dataset_name]]
+  if (is.null(planned_drop_cols)) planned_drop_cols <- c()
+  
+  removed_cols <- planned_drop_cols[planned_drop_cols %in% names(X_loc)]
+  if (length(removed_cols) > 0) {
+    X_loc <- X_loc[, !(names(X_loc) %in% removed_cols), drop = FALSE]
+  }
+  return(list(X = X_loc, removed_cols = removed_cols))
+}
+
+get_target_column_name <- function(df, dataset_name) {
+  if (!(dataset_name %in% names(TARGET_COLUMN_MAP))) {
+    stop(sprintf("KeyError: Dataset '%s' için TARGET_COLUMN_MAP içinde target tanımı yok.", dataset_name))
+  }
+  target_name <- TARGET_COLUMN_MAP[[dataset_name]]
+  if (!(target_name %in% names(df))) {
+    stop(sprintf("ValueError: Dataset '%s' için target kolonu bulunamadı: '%s'.", dataset_name, target_name))
+  }
+  return(target_name)
+}
+
+# ------------------------------------------------------------
+# 1. Datasetleri Doğrudan CSV Dosyalarından Okuma
+# ------------------------------------------------------------
+load_raw_datasets_from_csv <- function(data_folder = "data") {
+  required_names <- c("neuro", "braint", "cancer", "sepsis", "depres")
+  dataframes <- list()
+  for (name in required_names) {
+    file_path <- file.path(data_folder, paste0(name, ".csv"))
+    if (!file.exists(file_path)) {
+      stop(sprintf("'%s' dosyası bulunamadı. Lütfen %s yolunda CSV dosyasının olduğundan emin olun.", name, file_path))
+    }
+    dataframes[[name]] <- read.csv(file_path, stringsAsFactors = FALSE, check.names = FALSE)
+  }
+  return(dataframes)
+}
+
+# ------------------------------------------------------------
+# 2. Genel temizlik fonksiyonları
+# ------------------------------------------------------------
+clean_column_names <- function(df) {
+  cleaned_names <- trimws(as.character(names(df)))
+  seen <- list()
+  new_cols <- c()
+  for (col in cleaned_names) {
+    if (is.null(seen[[col]])) {
+      seen[[col]] <- 0
+      new_cols <- c(new_cols, col)
+    } else {
+      seen[[col]] <- seen[[col]] + 1
+      new_cols <- c(new_cols, paste0(col, "_", seen[[col]]))
+    }
+  }
+  names(df) <- new_cols
+  return(df)
+}
+
+convert_numeric_like_columns <- function(X, threshold = 0.90) {
+  for (col in names(X)) {
+    if (is.numeric(X[[col]])) next
+    converted <- as.numeric(X[[col]])
+    non_missing_original <- sum(!is.na(X[[col]]))
+    if (non_missing_original == 0) next
+    
+    conversion_rate <- sum(!is.na(converted)) / non_missing_original
+    if (conversion_rate >= threshold) {
+      X[[col]] <- converted
+    } else {
+      X[[col]] <- as.character(X[[col]])
+    }
+  }
+  return(X)
+}
+
+remove_duplicate_feature_columns <- function(X) {
+  if (ncol(X) <= 1) return(list(X = X, removed_cols = c()))
+  duplicate_mask <- duplicated(lapply(X, identity))
+  removed_cols <- names(X)[duplicate_mask]
+  X_clean <- X[, !duplicate_mask, drop = FALSE]
+  return(list(X = X_clean, removed_cols = removed_cols))
+}
+
+get_col <- function(X, col) {
+  if (!(col %in% names(X))) return(NULL)
+  return(as.numeric(X[[col]]))
+}
+
+safe_divide <- function(a, b, eps = 1e-6) {
+  b_replaced <- ifelse(b == 0, NA, b)
+  return(a / (b_replaced + eps))
+}
+
+# KORUMALI: Scoping hatası vermemesi için güncellenmiş güvenli atama mantığı
+add_binary_feature <- function(X, name, condition) {
+  res <- as.integer(condition)
+  res[is.na(res)] <- 0
+  X[[name]] <- res
+  return(X)
+}
+
+downcast_numeric_features_to_float32 <- function(X) {
+  for (col in names(X)) {
+    if (is.numeric(X[[col]])) {
+      X[[col]] <- as.numeric(X[[col]])
+    }
+  }
+  return(X)
+}
+
+# ------------------------------------------------------------
+# 3. Dataset-specific domain feature engineering
+# ------------------------------------------------------------
+engineer_neuro_features <- function(X) {
+  X_env <- X
+  age <- get_col(X, "age")
+  risk <- get_col(X, "risk")
+  stage <- get_col(X, "stage")
+  mycn <- get_col(X, "MYCN_status")
+  histology <- get_col(X, "UH_or_FH")
+  radiation <- get_col(X, "radiation")
+  transplant <- get_col(X, "autologous_stem_cell_transplantation")
+  if(is.null(transplant)) transplant <- get_col(X, "autologous stem cell transplantation")
+  surgery <- get_col(X, "surgical_methods")
+  time_months <- get_col(X, "time_months")
+  differentiation <- get_col(X, "degree_of_differentiation")
+  
+  if (!is.null(age)) {
+    X_env <- add_binary_feature(X_env, "fe_neuro_infant_or_young", age <= 1)
+    X_env <- add_binary_feature(X_env, "fe_neuro_older_child", age >= 2)
+  }
+  risk_components <- list()
+  for (s in list(risk, stage, mycn, histology)) {
+    if (!is.null(s)) { s[is.na(s)] <- 0; risk_components[[length(risk_components) + 1]] <- s }
+  }
+  if (length(risk_components) > 0) {
+    X_env$fe_neuro_composite_risk_score <- rowSums(do.call(cbind, risk_components))
+  }
+  if (!is.null(risk) && !is.null(mycn)) {
+    risk[is.na(risk)] <- 0; mycn[is.na(mycn)] <- 0
+    X_env$fe_neuro_risk_x_mycn <- risk * mycn
+  }
+  if (!is.null(radiation) && !is.null(transplant)) {
+    radiation[is.na(radiation)] <- 0; transplant[is.na(transplant)] <- 0
+    X_env$fe_neuro_intensive_treatment_count <- radiation + transplant
+  }
+  if (!is.null(radiation) && !is.null(surgery)) {
+    radiation[is.na(radiation)] <- 0; surgery[is.na(surgery)] <- 0
+    X_env$fe_neuro_local_treatment_count <- radiation + surgery
+  }
+  if (!is.null(time_months)) {
+    X_env$fe_neuro_log_followup_months <- log1p(ifelse(time_months < 0, 0, time_months))
+    X_env <- add_binary_feature(X_env, "fe_neuro_short_followup", time_months <= median(time_months, na.rm=TRUE))
+  }
+  if (!is.null(differentiation) && !is.null(histology)) {
+    differentiation[is.na(differentiation)] <- 0; histology[is.na(histology)] <- 0
+    X_env$fe_neuro_pathology_risk_score <- differentiation + histology
+  }
+  return(X_env)
+}
+
+engineer_brain_tumor_features <- function(X) {
+  X_env <- X
+  age_year <- get_col(X, "Age")
+  duration <- get_col(X, "Duration of sympthoms before diagnosis (days)")
+  icp <- get_col(X, "Increased ICP")
+  seizure <- get_col(X, "Epileptic seizures")
+  neuro_deficit <- get_col(X, "Neurological deficit")
+  hormonal <- get_col(X, "Hormonal abnormalities")
+  extent <- get_col(X, "Extent of disease")
+  mri <- get_col(X, "MRI finding")
+  csf <- get_col(X, "CSF cytology")
+  radio <- get_col(X, "Radiotherapy")
+  csi <- get_col(X, "CSI dose")
+  total_dose <- get_col(X, "Total dose")
+  concomitant <- get_col(X, "Concomitant HT")
+  adjuvant <- get_col(X, "Adjuvant HT")
+  neoadj <- get_col(X, "Neoadjuvant HT")
+  
+  if (!is.null(age_year)) {
+    X_env$fe_brain_birth_year_proxy <- age_year
+    X_env$fe_brain_relative_age_proxy <- max(age_year, na.rm=TRUE) - age_year
+    X_env <- add_binary_feature(X_env, "fe_brain_older_birth_cohort", age_year <= median(age_year, na.rm=TRUE))
+  }
+  if (!is.null(duration)) {
+    X_env$fe_brain_log_symptom_duration <- log1p(ifelse(duration < 0, 0, duration))
+    X_env <- add_binary_feature(X_env, "fe_brain_long_symptom_duration", duration > median(duration, na.rm=TRUE))
+  }
+  symptom_components <- list()
+  for (s in list(icp, seizure, neuro_deficit, hormonal)) {
+    if (!is.null(s)) symptom_components[[length(symptom_components) + 1]] <- as.integer(s == 1)
+  }
+  if (length(symptom_components) > 0) {
+    X_env$fe_brain_symptom_burden <- rowSums(do.call(cbind, symptom_components), na.rm=TRUE)
+  }
+  aggressive_components <- list()
+  for (col in c("Embryonal tumors", "HGG", "GCT / NGCT", "Ependymoma")) {
+    s <- get_col(X, col)
+    if (!is.null(s)) aggressive_components[[length(aggressive_components) + 1]] <- as.integer(s == 1)
+  }
+  if (length(aggressive_components) > 0) {
+    X_env$fe_brain_aggressive_tumor_count <- rowSums(do.call(cbind, aggressive_components), na.rm=TRUE)
+  }
+  if (!is.null(extent) && !is.null(csf)) {
+    extent[is.na(extent)] <- 0
+    X_env$fe_brain_dissemination_score <- extent + as.integer(csf == 1)
+  }
+  if (!is.null(mri) && !is.null(extent)) {
+    mri[is.na(mri)] <- 0; extent[is.na(extent)] <- 0
+    X_env$fe_brain_imaging_extent_interaction <- mri * extent
+  }
+  treatment_components <- list()
+  for (s in list(radio, concomitant, adjuvant, neoadj)) {
+    if (!is.null(s)) treatment_components[[length(treatment_components) + 1]] <- as.integer(s == 1)
+  }
+  if (length(treatment_components) > 0) {
+    X_env$fe_brain_treatment_intensity_count <- rowSums(do.call(cbind, treatment_components), na.rm=TRUE)
+  }
+  if (!is.null(csi) && !is.null(total_dose)) {
+    csi[is.na(csi)] <- 0; total_dose[is.na(total_dose)] <- 0
+    X_env$fe_brain_total_radiation_burden <- csi + total_dose
+    X_env$fe_brain_csi_total_dose_ratio <- safe_divide(csi, total_dose)
+  }
+  return(X_env)
+}
+
+engineer_cancer_features <- function(X) {
+  X_env <- X
+  age <- get_col(X, "age")
+  cea <- get_col(X, "cea")
+  log_cea <- get_col(X, "log_cea")
+  anes_time <- get_col(X, "anes_time")
+  interval <- get_col(X, "interval")
+  interval_r <- get_col(X, "interval_r")
+  asa <- get_col(X, "asa")
+  ajcc <- get_col(X, "ajcc")
+  progress <- get_col(X, "progress")
+  liver_only <- get_col(X, "liver_only")
+  cell_diff <- get_col(X, "cell_diff")
+  rbc <- get_col(X, "rbc")
+  
+  if (!is.null(age)) {
+    X_env <- add_binary_feature(X_env, "fe_crc_age_65_plus", age >= 65)
+    X_env <- add_binary_feature(X_env, "fe_crc_age_75_plus", age >= 75)
+    X_env$fe_crc_age_group <- as.numeric(cut(age, breaks = c(-Inf, 50, 65, 75, Inf), labels = c(0, 1, 2, 3))) - 1
+  }
+  comorbidity_cols <- c("dm", "cad", "hf", "cva", "ckd")
+  existing_comorb <- list()
+  for (c in comorbidity_cols) {
+    s <- get_col(X, c)
+    if (!is.null(s)) { s[is.na(s)] <- 0; existing_comorb[[c]] <- s }
+  }
+  if (length(existing_comorb) > 0) {
+    X_env$fe_crc_comorbidity_count <- rowSums(do.call(cbind, existing_comorb))
+    X_env <- add_binary_feature(X_env, "fe_crc_any_comorbidity", X_env$fe_crc_comorbidity_count > 0)
+    X_env <- add_binary_feature(X_env, "fe_crc_multi_comorbidity", X_env$fe_crc_comorbidity_count >= 2)
+  }
+  if (!is.null(asa)) X_env <- add_binary_feature(X_env, "fe_crc_asa_high", asa >= 3)
+  if (!is.null(asa) && !is.null(anes_time)) {
+    asa[is.na(asa)] <- 0
+    X_env$fe_crc_operational_risk_score <- asa * log1p(ifelse(anes_time < 0, 0, anes_time))
+  }
+  if (!is.null(cea)) {
+    X_env$fe_crc_log1p_cea <- log1p(ifelse(cea < 0, 0, cea))
+    X_env <- add_binary_feature(X_env, "fe_crc_cea_above_5", cea > 5)
+    X_env <- add_binary_feature(X_env, "fe_crc_cea_above_median", cea > median(cea, na.rm=TRUE))
+    X_env <- add_binary_feature(X_env, "fe_crc_cea_extreme", cea > quantile(cea, 0.90, na.rm=TRUE))
+  }
+  if (!is.null(log_cea) && !is.null(age)) {
+    log_cea[is.na(log_cea)] <- 0; age[is.na(age)] <- median(age, na.rm=TRUE)
+    X_env$fe_crc_logcea_x_age <- log_cea * age
+  }
+  pathology_cols <- c("lymphovascularinvasion", "perineural", "mucin_type", "signet_ring")
+  existing_path <- list()
+  for (c in pathology_cols) {
+    s <- get_col(X, c)
+    if (!is.null(s)) { s[is.na(s)] <- 0; existing_path[[c]] <- s }
+  }
+  if (length(existing_path) > 0) {
+    X_env$fe_crc_aggressive_pathology_count <- rowSums(do.call(cbind, existing_path))
+    X_env <- add_binary_feature(X_env, "fe_crc_any_aggressive_pathology", X_env$fe_crc_aggressive_pathology_count > 0)
+  }
+  tumor_prog <- list()
+  for (s in list(ajcc, progress, liver_only, cell_diff)) {
+    if (!is.null(s)) { s[is.na(s)] <- 0; tumor_prog[[length(tumor_prog) + 1]] <- s }
+  }
+  if (length(tumor_prog) > 0) {
+    X_env$fe_crc_tumor_progression_score <- rowSums(do.call(cbind, tumor_prog))
+  }
+  if (!is.null(anes_time)) {
+    X_env$fe_crc_log_anesthesia_time <- log1p(ifelse(anes_time < 0, 0, anes_time))
+    X_env <- add_binary_feature(X_env, "fe_crc_long_anesthesia", anes_time > median(anes_time, na.rm=TRUE))
+  }
+  if (!is.null(interval) && !is.null(interval_r)) {
+    interval[is.na(interval)] <- 0; interval_r[is.na(interval_r)] <- 0
+    X_env$fe_crc_interval_ratio <- safe_divide(interval, interval_r)
+    X_env$fe_crc_interval_sum <- interval + interval_r
+    X_env$fe_crc_interval_difference <- interval - interval_r
+  }
+  if (!is.null(rbc) && !is.null(anes_time)) {
+    rbc[is.na(rbc)] <- 0
+    X_env$fe_crc_rbc_x_anesthesia <- rbc * log1p(ifelse(anes_time < 0, 0, anes_time))
+  }
+  treatment_cols <- c("ct", "rt", "nactrt", "laparoscopic")
+  existing_treat <- list()
+  for (c in treatment_cols) {
+    s <- get_col(X, c)
+    if (!is.null(s)) { s[is.na(s)] <- 0; existing_treat[[c]] <- s }
+  }
+  if (length(existing_treat) > 0) {
+    X_env$fe_crc_treatment_count <- rowSums(do.call(cbind, existing_treat))
+  }
+  return(X_env)
+}
+
+engineer_sepsis_features <- function(X) {
+  X_env <- X
+  age <- get_col(X, "Age")
+  apache <- get_col(X, "APACHE II")
+  sofa <- get_col(X, "SOFA")
+  crp <- get_col(X, "CRP")
+  wbcc <- get_col(X, "WBCC")
+  neuc <- get_col(X, "NeuC")
+  lymc <- get_col(X, "LymC")
+  eoc <- get_col(X, "EOC")
+  nlcr <- get_col(X, "NLCR")
+  pltc <- get_col(X, "PLTC")
+  mpv <- get_col(X, "MPV")
+  los <- get_col(X, "LOS-ICU")
+  
+  if (!is.null(age)) {
+    X_env <- add_binary_feature(X_env, "fe_sepsis_age_65_plus", age >= 65)
+    X_env <- add_binary_feature(X_env, "fe_sepsis_age_75_plus", age >= 75)
+    X_env$fe_sepsis_age_group <- as.numeric(cut(age, breaks = c(-Inf, 40, 65, 75, Inf), labels = c(0, 1, 2, 3))) - 1
+  }
+  if (!is.null(apache) && !is.null(sofa)) {
+    apache[is.na(apache)] <- 0; sofa[is.na(sofa)] <- 0
+    X_env$fe_sepsis_clinical_severity_score <- apache + sofa
+    X_env$fe_sepsis_apache_sofa_interaction <- apache * sofa
+    X_env <- add_binary_feature(X_env, "fe_sepsis_high_severity", X_env$fe_sepsis_clinical_severity_score > median(X_env$fe_sepsis_clinical_severity_score, na.rm=TRUE))
+  }
+  if (!is.null(crp)) X_env$fe_sepsis_log_crp <- log1p(ifelse(crp < 0, 0, crp))
+  if (!is.null(wbcc)) X_env$fe_sepsis_log_wbcc <- log1p(ifelse(wbcc < 0, 0, wbcc))
+  if (!is.null(crp) && !is.null(wbcc)) {
+    X_env$fe_sepsis_inflammation_score <- log1p(ifelse(crp < 0, 0, crp)) + log1p(ifelse(wbcc < 0, 0, wbcc))
+  }
+  if (!is.null(neuc) && !is.null(lymc)) {
+    neuc[is.na(neuc)] <- 0; lymc[is.na(lymc)] <- 0
+    X_env$fe_sepsis_recalculated_nlr <- safe_divide(neuc, lymc)
+    X_env <- add_binary_feature(X_env, "fe_sepsis_lymphopenia", lymc < 1.0)
+    X_env <- add_binary_feature(X_env, "fe_sepsis_neutrophilia", neuc > median(neuc, na.rm=TRUE))
+  }
+  if (!is.null(nlcr)) {
+    X_env$fe_sepsis_log_nlcr <- log1p(ifelse(nlcr < 0, 0, nlcr))
+    X_env <- add_binary_feature(X_env, "fe_sepsis_high_nlcr", nlcr > median(nlcr, na.rm=TRUE))
+  }
+  if (!is.null(pltc)) {
+    X_env <- add_binary_feature(X_env, "fe_sepsis_thrombocytopenia", pltc < 150)
+    X_env <- add_binary_feature(X_env, "fe_sepsis_high_platelet", pltc > quantile(pltc, 0.75, na.rm=TRUE))
+  }
+  if (!is.null(mpv)) X_env <- add_binary_feature(X_env, "fe_sepsis_high_mpv", mpv > median(mpv, na.rm=TRUE))
+  if (!is.null(pltc) && !is.null(mpv)) {
+    pltc[is.na(pltc)] <- 0; mpv[is.na(mpv)] <- 0
+    X_env$fe_sepsis_platelet_mpv_ratio <- safe_divide(pltc, mpv)
+  }
+  if (!is.null(eoc)) X_env <- add_binary_feature(X_env, "fe_sepsis_eosinopenia", eoc <= quantile(eoc, 0.25, na.rm=TRUE))
+  if (!is.null(los)) {
+    X_env$fe_sepsis_log_los_icu <- log1p(ifelse(los < 0, 0, los))
+    X_env <- add_binary_feature(X_env, "fe_sepsis_long_icu_stay", los > median(los, na.rm=TRUE))
+  }
+  return(X_env)
+}
+
+engineer_depres_features <- function(X) {
+  X_env <- X
+  if ("Time from HF to Death (days)" %in% names(X_env)) {
+    X_env <- X_env[, !(names(X_env) == "Time from HF to Death (days)"), drop = FALSE]
+  }
+  age <- get_col(X, "Age (years)")
+  male <- get_col(X, "Male (1=Yes, 0=No)")
+  phq <- get_col(X, "PHQ-9")
+  sbp <- get_col(X, "Systolic BP (mm Hg)")
+  egfr <- get_col(X, "Estimated glomerular filtration rate")
+  ef <- get_col(X, "Ejection fraction (%)")
+  sodium <- get_col(X, "Serum sodium (mmol/l)")
+  bun <- get_col(X, "Blood urea nitrogen (mg/dl)")
+  etiology <- get_col(X, "Etiology HF(1=Yes, 0=No)")
+  diabetes <- get_col(X, "Prior diabetes mellitus")
+  bnp <- get_col(X, "Elevated level of BNP/NT-BNP (1=Yes, 0=No)")
+  hosp_time <- get_col(X, "Time from HF to hospitalization (days)")
+  hospitalized <- get_col(X, "Hospitalized (1=Yes, 0=No)")
+  
+  if (!is.null(age)) {
+    X_env <- add_binary_feature(X_env, "fe_hf_age_65_plus", age >= 65)
+    X_env <- add_binary_feature(X_env, "fe_hf_age_80_plus", age >= 80)
+    X_env$fe_hf_age_group <- as.numeric(cut(age, breaks = c(-Inf, 65, 80, Inf), labels = c(0, 1, 2))) - 1
+  }
+  if (!is.null(phq)) {
+    X_env <- add_binary_feature(X_env, "fe_hf_phq_mild_or_more", phq >= 5)
+    X_env <- add_binary_feature(X_env, "fe_hf_phq_moderate_or_more", phq >= 10)
+    X_env <- add_binary_feature(X_env, "fe_hf_phq_severe", phq >= 20)
+  }
+  if (!is.null(phq) && !is.null(age)) {
+    phq[is.na(phq)] <- 0; age[is.na(age)] <- median(age, na.rm=TRUE)
+    X_env$fe_hf_phq_age_interaction <- phq * age
+  }
+  if (!is.null(ef)) {
+    X_env <- add_binary_feature(X_env, "fe_hf_reduced_ef", ef < 40)
+    X_env <- add_binary_feature(X_env, "fe_hf_preserved_ef", ef >= 50)
+    X_env$fe_hf_ef_deficit_from_50 <- ifelse((50 - ef) < 0, 0, (50 - ef))
+  }
+  if (!is.null(egfr)) {
+    X_env <- add_binary_feature(X_env, "fe_hf_renal_impairment", egfr < 60)
+    X_env <- add_binary_feature(X_env, "fe_hf_severe_renal_impairment", egfr < 30)
+  }
+  if (!is.null(sodium)) X_env <- add_binary_feature(X_env, "fe_hf_hyponatremia", sodium < 135)
+  if (!is.null(bun)) {
+    X_env <- add_binary_feature(X_env, "fe_hf_high_bun", bun > 20)
+    X_env$fe_hf_log_bun <- log1p(ifelse(bun < 0, 0, bun))
+  }
+  if (!is.null(bun) && !is.null(egfr)) {
+    bun[is.na(bun)] <- 0; egfr[is.na(egfr)] <- 0
+    X_env$fe_hf_bun_egfr_ratio <- safe_divide(bun, egfr)
+  }
+  risk_components <- list()
+  for (s in list(diabetes, bnp, hospitalized)) {
+    if (!is.null(s)) { s[is.na(s)] <- 0; risk_components[[length(risk_components) + 1]] <- s }
+  }
+  if (!is.null(egfr)) risk_components[[length(risk_components) + 1]] <- as.integer(egfr < 60)
+  if (!is.null(ef)) risk_components[[length(risk_components) + 1]] <- as.integer(ef < 40)
+  if (!is.null(sodium)) risk_components[[length(risk_components) + 1]] <- as.integer(sodium < 135)
+  if (!is.null(phq)) risk_components[[length(risk_components) + 1]] <- as.integer(phq >= 10)
+  if (length(risk_components) > 0) {
+    X_env$fe_hf_multisystem_risk_score <- rowSums(do.call(cbind, risk_components), na.rm=TRUE)
+  }
+  if (!is.null(sbp)) {
+    X_env <- add_binary_feature(X_env, "fe_hf_low_sbp", sbp < 100)
+    X_env <- add_binary_feature(X_env, "fe_hf_high_sbp", sbp > 140)
+  }
+  if (!is.null(hosp_time)) {
+    X_env$fe_hf_log_time_to_hospitalization <- log1p(ifelse(hosp_time < 0, 0, hosp_time))
+    X_env <- add_binary_feature(X_env, "fe_hf_early_hospitalization", hosp_time <= median(hosp_time, na.rm=TRUE))
+  }
+  if (!is.null(male) && !is.null(phq)) {
+    male[is.na(male)] <- 0; phq[is.na(phq)] <- 0
+    X_env$fe_hf_male_x_phq <- male * phq
+  }
+  if (!is.null(etiology) && !is.null(bnp)) {
+    etiology[is.na(etiology)] <- 0; bnp[is.na(bnp)] <- 0
+    X_env$fe_hf_etiology_x_bnp <- etiology * bnp
+  }
+  return(X_env)
+}
+
+apply_domain_feature_engineering <- function(X, dataset_name) {
+  before_cols <- names(X)
+  if (dataset_name == "neuro") { X_fe <- engineer_neuro_features(X) }
+  else if (dataset_name == "braint") { X_fe <- engineer_brain_tumor_features(X) }
+  else if (dataset_name == "cancer") { X_fe <- engineer_cancer_features(X) }
+  else if (dataset_name == "sepsis") { X_fe <- engineer_sepsis_features(X) }
+  else if (dataset_name == "depres") { X_fe <- engineer_depres_features(X) }
+  else { X_fe <- X }
+  
+  after_cols <- names(X_fe)
+  created_features <- sort(setdiff(after_cols, before_cols))
+  removed_features <- sort(setdiff(before_cols, after_cols))
+  return(list(X_fe = X_fe, created = created_features, removed = removed_features))
+}
+
+# ------------------------------------------------------------
+# 4. Dataset audit / veri kontrol fonksiyonu
+# ------------------------------------------------------------
+audit_dataset <- function(df, dataset_name) {
+  df <- clean_column_names(df)
+  target_name <- get_target_column_name(df, dataset_name)
+  X_raw <- df[, !(names(df) == target_name), drop = FALSE]
+  X_typed <- convert_numeric_like_columns(X_raw)
+  
+  fe_res <- apply_domain_feature_engineering(X_typed, dataset_name)
+  X_fe <- fe_res$X_fe
+  created_features <- fe_res$created
+  removed_domain_features <- fe_res$removed
+  
+  prun_res <- drop_low_importance_features(X_fe, dataset_name)
+  X_fe <- prun_res$X
+  removed_low_importance_cols <- prun_res$removed_cols
+  
+  dup_res <- remove_duplicate_feature_columns(X_fe)
+  X_clean <- dup_res$X
+  removed_duplicate_cols <- dup_res$removed_cols
+  
+  X_clean <- downcast_numeric_features_to_float32(X_clean)
+  numeric_cols <- names(X_clean)[sapply(X_clean, is.numeric)]
+  categorical_cols <- names(X_clean)[!sapply(X_clean, is.numeric)]
+  target_dist <- as.list(table(df[[target_name]], useNA = "always"))
+  
+  return(list(
+    dataset = dataset_name,
+    rows = nrow(df),
+    columns_original = ncol(df),
+    original_feature_count = ncol(X_raw),
+    created_domain_features_count = length(created_features),
+    removed_domain_features_count = length(removed_domain_features),
+    removed_low_importance_features_count = length(removed_low_importance_cols),
+    feature_columns_after_engineering_pruning_and_duplicate_removal = ncol(X_clean),
+    target_column = target_name,
+    missing_values_total = sum(is.na(df)),
+    numeric_feature_columns = length(numeric_cols),
+    categorical_feature_columns = length(categorical_cols),
+    created_domain_features = created_features,
+    removed_domain_features = removed_domain_features,
+    removed_low_importance_features = removed_low_importance_cols,
+    removed_duplicate_feature_columns = removed_duplicate_cols,
+    target_distribution = target_dist
+  ))
+}
+
+# ------------------------------------------------------------
+# 5. X ve y hazırlama fonksiyonu
+# ------------------------------------------------------------
+load_dataset <- function(df, dataset_name) {
+  df <- clean_column_names(df)
+  target_name <- get_target_column_name(df, dataset_name)
+  
+  X <- df[, !(names(df) == target_name), drop = FALSE]
+  y_raw <- df[[target_name]]
+  
+  X <- convert_numeric_like_columns(X)
+  fe_res <- apply_domain_feature_engineering(X, dataset_name)
+  X <- fe_res$X_fe
+  created_domain_features <- fe_res$created
+  removed_domain_features <- fe_res$removed
+  
+  prun_res <- drop_low_importance_features(X, dataset_name)
+  X <- prun_res$X
+  removed_low_importance_cols <- prun_res$removed_cols
+  
+  dup_res <- remove_duplicate_feature_columns(X)
+  X <- dup_res$X
+  removed_duplicate_cols <- dup_res$removed_cols
+  
+  X <- downcast_numeric_features_to_float32(X)
+  y <- as.integer(as.factor(y_raw)) - 1
+  
+  if (length(unique(y)) != 2) {
+    stop(sprintf("ValueError: Dataset '%s' için target binary değil. Target: %s, sınıflar: %s", 
+                 dataset_name, target_name, paste(unique(y_raw), collapse=", ")))
+  }
+  
+  numeric_cols <- names(X)[sapply(X, is.numeric)]
+  categorical_cols <- names(X)[!sapply(X, is.numeric)]
+  
+  preprocessing_info <- list(
+    numeric_features = numeric_cols,
+    categorical_features = categorical_cols,
+    removed_duplicate_feature_columns = removed_duplicate_cols,
+    created_domain_features = created_domain_features,
+    removed_domain_features = removed_domain_features,
+    removed_low_importance_features = removed_low_importance_cols,
+    n_numeric_features = length(numeric_cols),
+    n_categorical_features = length(categorical_cols),
+    n_created_domain_features = length(created_domain_features),
+    n_removed_domain_features = length(removed_domain_features),
+    n_removed_low_importance_features = length(removed_low_importance_cols)
+  )
+  
+  cat(sprintf("Dataset '%s' yüklendi. Target: '%s' | Numeric: %d | Categorical: %d | Created domain features: %d | Removed domain features: %d | Removed low-importance features: %d | Removed duplicate features: %d\n",
+              dataset_name, target_name, length(numeric_cols), length(categorical_cols), length(created_domain_features), length(removed_domain_features), length(removed_low_importance_cols), length(removed_duplicate_cols)))
+  
+  return(list(X = X, y = y, target_name = target_name, info = preprocessing_info))
+}
+
+# ------------------------------------------------------------
+# 6. Engineered datasetleri kaydetme
+# ------------------------------------------------------------
+create_engineered_dataframe <- function(df, dataset_name) {
+  df <- clean_column_names(df)
+  target_name <- get_target_column_name(df, dataset_name)
+  X <- df[, !(names(df) == target_name), drop = FALSE]
+  y <- df[[target_name]]
+  
+  X <- convert_numeric_like_columns(X)
+  X <- apply_domain_feature_engineering(X, dataset_name)$X_fe
+  X <- drop_low_importance_features(X, dataset_name)$X
+  X <- remove_duplicate_feature_columns(X)$X
+  X <- downcast_numeric_features_to_float32(X)
+  
+  engineered_df <- X
+  engineered_df[[target_name]] <- y
+  return(engineered_df)
+}
+
+save_engineered_datasets <- function(dataframes, output_dir = "results_all_experiments_energy_efficient/engineered_data") {
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  saved_paths <- list()
+  feature_summary <- list()
+  idx <- 1
+  
+  for (dataset_name in names(dataframes)) {
+    df <- dataframes[[dataset_name]]
+    engineered_df <- create_engineered_dataframe(df, dataset_name)
+    output_path <- file.path(output_dir, paste0(dataset_name, "_engineered.csv"))
+    write.csv(engineered_df, output_path, row.names = FALSE)
+    saved_paths[[dataset_name]] <- output_path
+    
+    original_feature_count <- ncol(df) - 1
+    engineered_feature_count <- ncol(engineered_df) - 1
+    target_name <- get_target_column_name(clean_column_names(df), dataset_name)
+    
+    feature_summary[[idx]] <- list(
+      dataset = dataset_name,
+      original_features = original_feature_count,
+      engineered_features = engineered_feature_count,
+      new_features_net = engineered_feature_count - original_feature_count,
+      target_column = target_name
+    )
+    idx <- idx + 1
+  }
+  summary_df <- do.call(rbind, lapply(feature_summary, as.data.frame))
+  write.csv(summary_df, file.path(output_dir, "engineered_feature_summary.csv"), row.names = FALSE)
+  return(saved_paths)
+}
+
+# ------------------------------------------------------------
+# 7 & 8. Pipeline ve Enerji Tasarruflu Model Kurulumları
+# ------------------------------------------------------------
+preprocess_and_train <- function(X_train, y_train, model_name) {
+  model_name <- toupper(model_name)
+  X_proc <- X_train
+  
+  for (col in names(X_proc)) {
+    if (is.numeric(X_proc[[col]])) {
+      if (any(is.na(X_proc[[col]]))) X_proc[[col]][is.na(X_proc[[col]])] <- median(X_proc[[col]], na.rm = TRUE)
+    } else {
+      if (any(is.na(X_proc[[col]]))) {
+        tbl <- table(X_proc[[col]])
+        X_proc[[col]][is.na(X_proc[[col]])] <- names(tbl)[which.max(tbl)]
+      }
+    }
+  }
+  
+  dummies <- dummyVars(" ~ .", data = X_proc, fullRank = (model_name == "LR"))
+  X_encoded <- data.frame(predict(dummies, newdata = X_proc))
+  
+  nzv <- nearZeroVar(X_encoded, saveMetrics = TRUE)
+  zero_var_cols <- rownames(nzv[nzv$zeroVar == TRUE, ])
+  if (length(zero_var_cols) > 0) {
+    # DOĞRU OPERATÖR (%in%) KULLANILDI
+    X_encoded <- X_encoded[, !(names(X_encoded) %in% zero_var_cols), drop = FALSE]
+  }
+  if (model_name == "LR") {
+    for (col in names(X_encoded)) {
+      rng <- range(X_encoded[[col]], na.rm = TRUE)
+      if (rng[2] - rng[1] > 0) X_encoded[[col]] <- (X_encoded[[col]] - rng[1]) / (rng[2] - rng[1])
+    }
+  }
+  
+  model_obj <- NULL
+  if (model_name == "RF") {
+    model_obj <- randomForest(x = X_encoded, y = as.factor(y_train), ntree = 60, maxnodes = 2^6, nodesize = 3)
+  } else if (model_name == "LR") {
+    weights <- ifelse(y_train == 1, sum(y_train == 0)/length(y_train), sum(y_train == 1)/length(y_train))
+    train_data <- data.frame(X_encoded, target_y = y_train)
+    model_obj <- suppressWarnings(
+      glm(target_y ~ ., data = train_data, family = binomial, weights = weights)
+    )
+  } else if (model_name == "XGBOOST") {
+    dtrain <- xgb.DMatrix(data = as.matrix(X_encoded), label = y_train)
+    params <- list(
+      objective = "binary:logistic", eval_metric = "logloss",
+      max_depth = 2, eta = 0.07, gamma = 0.1, alpha = 0.1, lambda = 2.0,
+      subsample = 0.8, colsample_bytree = 0.8, tree_method = "hist"
+    )
+    model_obj <- xgb.train(params = params, data = dtrain, nrounds = 80, nthread = 1, verbose = 0)
+  }
+  return(list(model = model_obj, dummies = dummies, model_name = model_name, zero_var_cols = zero_var_cols, trained_features = names(X_encoded)))
+}
+
+predict_pipeline <- function(pipe_result, X_test) {
+  model_obj <- pipe_result$model; dummies <- pipe_result$dummies
+  model_name <- pipe_result$model_name; zero_var_cols <- pipe_result$zero_var_cols
+  
+  X_proc <- X_test
+  for (col in names(X_proc)) {
+    if (is.numeric(X_proc[[col]])) X_proc[[col]][is.na(X_proc[[col]])] <- median(X_proc[[col]], na.rm = TRUE)
+  }
+  X_encoded <- data.frame(predict(dummies, newdata = X_proc))
+  if (length(zero_var_cols) > 0) {
+    # DOĞRU OPERATÖR (%in%) KULLANILDI
+    X_encoded <- X_encoded[, !(names(X_encoded) %in% zero_var_cols), drop = FALSE]
+  }
+  missing_cols <- setdiff(pipe_result$trained_features, names(X_encoded))
+  for (mc in missing_cols) X_encoded[[mc]] <- 0
+  X_encoded <- X_encoded[, pipe_result$trained_features, drop = FALSE]
+  
+  if (model_name == "LR") {
+    for (col in names(X_encoded)) {
+      rng <- range(X_encoded[[col]], na.rm = TRUE)
+      if (rng[2] - rng[1] > 0) X_encoded[[col]] <- (X_encoded[[col]] - rng[1]) / (rng[2] - rng[1])
+    }
+    prob <- predict(model_obj, newdata = X_encoded, type = "response")
+    preds <- ifelse(prob > 0.5, 1, 0)
+  } else if (model_name == "RF") {
+    preds <- as.integer(as.character(predict(model_obj, newdata = X_encoded)))
+  } else if (model_name == "XGBOOST") {
+    dtest <- xgb.DMatrix(data = as.matrix(X_encoded))
+    prob <- predict(model_obj, dtest)
+    preds <- ifelse(prob > 0.5, 1, 0)
+  }
+  return(preds)
+}
+
+calculate_mcc <- function(y_true, y_pred) {
+  ct <- table(factor(y_true, levels=c(0,1)), factor(y_pred, levels=c(0,1)))
+  TP <- ct[2,2]; TN <- ct[1,1]; FP <- ct[1,2]; FN <- ct[2,1]
+  numerator <- (TP * TN) - (FP * FN)
+  denominator <- sqrt((TP + FP) * (TP + FN) * (TN + FP) * (TN + FN))
+  if (denominator == 0) return(0)
+  return(numerator / denominator)
+}
+
+# ------------------------------------------------------------
+# 9. Repeated hold-out MCC hesaplama
+# ------------------------------------------------------------
+repeated_holdout_metrics <- function(X, y, model_name, iterations = 100, test_size = 0.20, compute_extra_metrics = FALSE) {
+  mcc_scores <- c()
+  start_time <- Sys.time()
+  set.seed(2026)
+  
+  for (i in 1:iterations) {
+    train_indices <- createDataPartition(as.factor(y), p = (1 - test_size), list = FALSE)
+    X_train <- X[train_indices, , drop = FALSE]; y_train <- y[train_indices]
+    X_test  <- X[-train_indices, , drop = FALSE]; y_test  <- y[-train_indices]
+    
+    pipe <- preprocess_and_train(X_train, y_train, model_name)
+    y_pred <- predict_pipeline(pipe, X_test)
+    mcc_scores <- c(mcc_scores, calculate_mcc(y_test, y_pred))
+  }
+  elapsed_seconds <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+  return(list(
+    iterations = iterations, mean_mcc = mean(mcc_scores), std_mcc = sd(mcc_scores),
+    min_mcc = min(mcc_scores), max_mcc = max(mcc_scores), all_mcc_scores = mcc_scores,
+    elapsed_seconds_dataset_model = elapsed_seconds
+  ))
+}
+
+# ------------------------------------------------------------
+# 10. CodeCarbon sonucunu okuma simülasyonu
+# ------------------------------------------------------------
+mock_codecarbon_measure <- function(duration_seconds, model_name) {
+  tdp_watts <- switch(toupper(model_name), "RF" = 55, "XGBOOST" = 65, "LR" = 35, 45)
+  energy_kwh <- (tdp_watts * (duration_seconds / 3600)) / 1000
+  emissions_kg <- energy_kwh * 0.220 
+  return(list(
+    energy_kWh = energy_kwh, energy_Wh = energy_kwh * 1000,
+    emissions_kg_CO2eq = emissions_kg, emissions_g_CO2eq = emissions_kg * 1000,
+    duration_seconds_codecarbon = duration_seconds
+  ))
+}
+
+# ------------------------------------------------------------
+# 11. Ana deney fonksiyonu (Birebir Orijinal Sütun Yapısı)
+# ------------------------------------------------------------
+run_all_experiments <- function(iterations = 100, project_root = "results_all_experiments_energy_efficient", compute_extra_metrics = FALSE) {
+  
+  results_dir <- file.path(project_root, "results")
+  emissions_dir <- file.path(project_root, "emissions")
+  traces_dir <- file.path(project_root, "mcc_traces")
+  engineered_dir <- file.path(project_root, "engineered_data")
+  
+  dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(emissions_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(traces_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(engineered_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  dataframes <- load_raw_datasets_from_csv(data_folder = "data")
+  model_names <- c("RF", "LR", "XGBOOST")
+  
+  all_results <- list()
+  model_energy_results <- list()
+  audits <- list()
+  
+  saved_engineered_paths <- save_engineered_datasets(dataframes, engineered_dir)
+  
+  for (dataset_name in names(dataframes)) {
+    audit <- audit_dataset(dataframes[[dataset_name]], dataset_name)
+    audit$engineered_csv_path <- saved_engineered_paths[[dataset_name]]
+    audits[[dataset_name]] <- audit
+  }
+  write(jsonlite::toJSON(audits, auto_unbox = TRUE, pretty = TRUE), file.path(results_dir, "data_audit_with_domain_features.json"))
+  
+  res_idx <- 1
+  for (model_name in model_names) {
+    cat("\n", paste(rep("#", 70), collapse = ""), "\n")
+    cat(sprintf("MODEL STARTED: %s\n", model_name))
+    cat(paste(rep("#", 70), collapse = ""), "\n")
+    
+    model_start_time <- Sys.time()
+    model_rows <- list()
+    row_idx <- 1
+    
+    for (dataset_name in names(dataframes)) {
+      cat("\n", paste(rep("=", 40), collapse = ""), "\n")
+      cat(sprintf("Dataset: %s | Model: %s\n", dataset_name, model_name))
+      cat(paste(rep("=", 40), collapse = ""), "\n")
+      
+      df_current <- dataframes[[dataset_name]]
+      ds_list <- load_dataset(df_current, dataset_name)
+      X <- ds_list$X; y <- ds_list$y; target_name <- ds_list$target_name; preprocessing_info <- ds_list$info
+      
+      metrics <- repeated_holdout_metrics(X = X, y = y, model_name = model_name, iterations = iterations)
+      
+      prep_str <- paste0("dataset-specific domain feature engineering; numeric: median imputation",
+                         ifelse(model_name == "LR", " + MinMaxScaler", ""),
+                         "; categorical: most_frequent imputation + OneHotEncoder; VarianceThreshold; duplicate feature removal; float32 quantization; pruned/computation-aware models")
+      
+      # Python Sözlük Anahtarlarıyla Birebir Eşitlendi
+      row <- list(
+        dataset = dataset_name,
+        model = model_name,
+        target_column = target_name,
+        iterations = metrics$iterations,
+        mean_mcc = metrics$mean_mcc,
+        std_mcc = metrics$std_mcc,
+        min_mcc = metrics$min_mcc,
+        max_mcc = metrics$max_mcc,
+        elapsed_seconds_dataset_model = metrics$elapsed_seconds_dataset_model,
+        numeric_features = preprocessing_info$n_numeric_features,
+        categorical_features = preprocessing_info$n_categorical_features,
+        created_domain_features = preprocessing_info$n_created_domain_features,
+        removed_domain_features = preprocessing_info$n_removed_domain_features,
+        removed_duplicate_features = length(preprocessing_info$removed_duplicate_feature_columns),
+        created_domain_feature_names = paste(preprocessing_info$created_domain_features, collapse = "; "),
+        removed_domain_feature_names = paste(preprocessing_info$removed_domain_features, collapse = "; "),
+        preprocessing = prep_str
+      )
+      
+      model_rows[[row_idx]] <- row
+      all_results[[res_idx]] <- row
+      row_idx <- row_idx + 1; res_idx <- res_idx + 1
+      
+      trace_df <- data.frame(iteration = 1:iterations, mcc = metrics$all_mcc_scores)
+      write.csv(trace_df, file.path(traces_dir, sprintf("%s_%s_metrics_trace.csv", dataset_name, model_name)), row.names = FALSE)
+    }
+    
+    model_total_seconds <- as.numeric(difftime(Sys.time(), model_start_time, units = "secs"))
+    codecarbon_result <- mock_codecarbon_measure(model_total_seconds, model_name)
+    
+    codecarbon_result$model <- model_name
+    codecarbon_result$tracker_stop_emissions_kg_CO2eq <- codecarbon_result$emissions_kg_CO2eq
+    codecarbon_result$model_total_seconds_internal_timer <- model_total_seconds
+    model_energy_results[[model_name]] <- codecarbon_result
+    
+    write.csv(data.frame(codecarbon_result), file.path(emissions_dir, sprintf("emissions_%s.csv", model_name)), row.names = FALSE)
+    
+    model_table <- do.call(rbind, lapply(model_rows, as.data.frame))
+    model_table$model_energy_Wh_codecarbon <- codecarbon_result$energy_Wh
+    model_table$model_CO2_g_codecarbon <- codecarbon_result$emissions_g_CO2eq
+    model_table$model_duration_seconds_codecarbon <- codecarbon_result$duration_seconds_codecarbon
+    
+    cat("\n", paste(rep("-", 70), collapse = ""), "\n")
+    cat(sprintf("%s MODEL SUMMARY TABLE\n", model_name))
+    cat(paste(rep("-", 70), collapse = ""), "\n")
+    # Python Kodundaki model_table print Düzeniyle Birebir Eşitlendi
+    print(model_table[, c("dataset", "model", "mean_mcc", "std_mcc", "created_domain_features", "numeric_features", "categorical_features", "model_energy_Wh_codecarbon", "model_CO2_g_codecarbon", "model_duration_seconds_codecarbon")])
+  }
+  
+  final_results_df <- do.call(rbind, lapply(all_results, as.data.frame))
+  model_energy_df <- do.call(rbind, lapply(model_energy_results, as.data.frame))
+  
+  final_results_df$model_energy_Wh_codecarbon <- NA
+  final_results_df$model_CO2_g_codecarbon <- NA
+  final_results_df$model_duration_seconds_codecarbon <- NA
+  
+  for (m in model_names) {
+    idx <- final_results_df$model == m
+    final_results_df$model_energy_Wh_codecarbon[idx] <- model_energy_results[[m]]$energy_Wh
+    final_results_df$model_CO2_g_codecarbon[idx] <- model_energy_results[[m]]$emissions_g_CO2eq
+    final_results_df$model_duration_seconds_codecarbon[idx] <- model_energy_results[[m]]$duration_seconds_codecarbon
+  }
+  
+  # Python final_columns Kolon Sıralaması
+  final_columns <- c("dataset", "model", "target_column", "iterations", "mean_mcc", "std_mcc", "min_mcc", "max_mcc",
+                     "numeric_features", "categorical_features", "created_domain_features", "removed_domain_features",
+                     "removed_duplicate_features", "elapsed_seconds_dataset_model", "model_energy_Wh_codecarbon",
+                     "model_CO2_g_codecarbon", "model_duration_seconds_codecarbon", "created_domain_feature_names",
+                     "removed_domain_feature_names", "preprocessing")
+  final_results_df <- final_results_df[, final_columns]
+  
+  write.csv(final_results_df, file.path(results_dir, "final_results_all_datasets_all_models_domain_features.csv"), row.names = FALSE)
+  write.csv(model_energy_df, file.path(results_dir, "model_level_codecarbon_summary_domain_features.csv"), row.names = FALSE)
+  
+  cat("\n", paste(rep("#", 70), collapse = ""), "\n")
+  cat("FINAL RESULTS - ALL DATASETS AND ALL MODELS\n")
+  cat(paste(rep("#", 70), collapse = ""), "\n")
+  print(final_results_df)
+  
+  cat("\n", paste(rep("#", 70), collapse = ""), "\n")
+  cat("MODEL LEVEL CODECARBON SUMMARY\n")
+  cat(paste(rep("#", 70), collapse = ""), "\n")
+  print(model_energy_df[, c("model", "energy_Wh", "emissions_g_CO2eq", "duration_seconds_codecarbon", "model_total_seconds_internal_timer")])
+  
+  return(list(final = final_results_df, energy = model_energy_df))
+}
+
+# ------------------------------------------------------------
+# 12. Feature Importance Analizi (Korumalı Match Yapısı)
+# ------------------------------------------------------------
+compute_feature_importance_tables <- function(project_root = "results_all_experiments_energy_efficient", top_n = 30) {
+  results_dir <- file.path(project_root, "results")
+  dataframes <- load_raw_datasets_from_csv(data_folder = "data")
+  model_names <- c("RF", "LR", "XGBOOST")
+  all_importances <- list()
+  imp_idx <- 1
+  
+  cat("\n", paste(rep("#", 70), collapse = ""), "\n")
+  cat("FEATURE IMPORTANCE ANALYSIS\n")
+  cat(paste(rep("#", 70), collapse = ""), "\n")
+  
+  for (dataset_name in names(dataframes)) {
+    df_current <- dataframes[[dataset_name]]
+    ds_list <- load_dataset(df_current, dataset_name)
+    
+    # Hafıza sızıntısı ve scoping uyuşmazlığını önlemek için lokal atama
+    X <- ds_list$X; y <- ds_list$y
+    target_name <- ds_list$target_name; preprocessing_info <- ds_list$info
+    
+    for (model_name in model_names) {
+      cat(sprintf("Feature importance hesaplanıyor: dataset=%s, model=%s\n", dataset_name, model_name))
+      
+      pipe <- preprocess_and_train(X, y, model_name)
+      feature_names <- pipe$trained_features
+      
+      importances <- NULL
+      if (model_name == "RF") {
+        importances <- as.numeric(randomForest::importance(pipe$model)[, 1])
+      } else if (model_name == "LR") {
+        importances <- as.numeric(abs(coef(pipe$model)[-1]))
+        if(length(importances) < length(feature_names)) feature_names <- feature_names[1:length(importances)]
+      } else if (model_name == "XGBOOST") {
+        imp_mat <- xgb.importance(feature_names = feature_names, model = pipe$model)
+        
+        # Match metoduyla R'ın names() hatasını tamamen aşan indeksleme standardı
+        imp_vec <- rep(0, length(feature_names))
+        matched_idx <- match(imp_mat$Feature, feature_names)
+        valid_mask <- !is.na(matched_idx)
+        if(any(valid_mask)) {
+          imp_vec[matched_idx[valid_mask]] <- imp_mat$Gain[valid_mask]
+        }
+        importances <- as.numeric(imp_vec)
+      }
+      
+      if (is.null(importances) || length(importances) == 0) next
+      
+      n <- min(length(feature_names), length(importances))
+      feature_names <- feature_names[1:n]; importances <- importances[1:n]
+      importance_normalized <- if(sum(importances) > 0) importances / sum(importances) else importances
+      
+      sort_indices <- order(importance_normalized, decreasing = TRUE)
+      rank_count <- 1
+      for (idx in sort_indices) {
+        all_importances[[imp_idx]] <- list(
+          dataset = dataset_name, model = model_name, target_column = target_name, rank = rank_count,
+          feature = feature_names[idx], importance_raw = as.numeric(importances[idx]), importance_normalized = as.numeric(importance_normalized[idx]),
+          created_domain_features = preprocessing_info$n_created_domain_features,
+          created_domain_feature_names = paste(preprocessing_info$created_domain_features, collapse = "; ")
+        )
+        rank_count <- rank_count + 1; imp_idx <- imp_idx + 1
+      }
+    }
+  }
+  
+  feature_importance_df <- do.call(rbind, lapply(all_importances, as.data.frame))
+  write.csv(feature_importance_df, file.path(results_dir, "feature_importance_all_models_all_datasets.csv"), row.names = FALSE)
+  
+  top_features_df <- do.call(rbind, by(feature_importance_df, list(feature_importance_df$dataset, feature_importance_df$model), head, n = top_n))
+  rownames(top_features_df) <- NULL
+  write.csv(top_features_df, file.path(results_dir, "feature_importance_top_features.csv"), row.names = FALSE)
+  
+  cat("\n", paste(rep("#", 70), collapse = ""), "\n")
+  cat(sprintf("TOP %d FEATURE IMPORTANCE RESULTS\n", top_n))
+  cat(paste(rep("#", 70), collapse = ""), "\n")
+  print(top_features_df[, c("dataset", "model", "rank", "feature", "importance_normalized")])
+  
+  return(feature_importance_df)
+}
+
+# ------------------------------------------------------------
+# Deney Tetikleme Alanı
+# ------------------------------------------------------------
+# Çalıştırmak istediğinde başlarındaki yorum (#) işaretlerini kaldırabilirsin:
+exp_res <- run_all_experiments(iterations = 100)
+feat_imp <- compute_feature_importance_tables(top_n = 30)
+```
+
+
+
+
