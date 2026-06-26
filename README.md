@@ -9,6 +9,7 @@ Developed as part of the **Green Computing** course in the Master's Degree Progr
 ---
 
 ## 👥 Authors
+
 * **Güldeniz Güzelay** (g.guezelay@campus.unimib.it)
 * **Sude Aslan** (s.aslan1@campus.unimib.it)
 
